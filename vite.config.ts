@@ -4,6 +4,7 @@ import { defineConfig, type ViteDevServer, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import type { IncomingMessage, ServerResponse } from 'http';
+import { MAX_BODY_BYTES, parseJsonObject } from './server/request.js';
 
 function apiRoutesPlugin(): Plugin {
   return {
@@ -25,19 +26,15 @@ function apiRoutesPlugin(): Plugin {
     configureServer(server: ViteDevServer) {
       server.middlewares.use(async (req: IncomingMessage, res: ServerResponse, next: () => void) => {
         if (!req.url?.startsWith('/api/')) return next();
-
-        // Parse JSON body for POST
-        if (req.method === 'POST') {
-          const chunks: Buffer[] = [];
-          await new Promise<void>((resolve) => {
-            req.on('data', (c: Buffer) => chunks.push(c));
-            req.on('end', resolve);
-          });
-          try {
-            (req as any).body = JSON.parse(Buffer.concat(chunks).toString());
-          } catch {
-            (req as any).body = {};
-          }
+        const route = req.url.split('?')[0];
+        const routes: Record<string, string> = {
+          '/api/analyze': '/api/analyze.js',
+          '/api/search': '/api/search.js',
+          '/api/status': '/api/status.js',
+        };
+        if (!Object.hasOwn(routes, route)) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: 'Not found' }));
         }
 
         // Express-compatible response shim
@@ -52,14 +49,34 @@ function apiRoutesPlugin(): Plugin {
           },
         };
 
-        const route = req.url.replace(/^\/api\//, '').replace(/\?.*$/, '');
         try {
-          const mod = await server.ssrLoadModule(`/api/${route}.js`);
+          if (req.method === 'POST' && route !== '/api/status') {
+            const chunks: Buffer[] = [];
+            let size = 0;
+            const raw = await new Promise<string>((resolve, reject) => {
+              req.on('data', (chunk: Buffer) => {
+                size += chunk.length;
+                if (size > MAX_BODY_BYTES) {
+                  chunks.length = 0;
+                  reject(Object.assign(new Error('Request too large'), { status: 413 }));
+                } else {
+                  chunks.push(chunk);
+                }
+              });
+              req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+              req.on('error', reject);
+              req.on('aborted', () => reject(new Error('Request aborted')));
+            });
+            const body = parseJsonObject(raw);
+            if (!body) return mockRes.status(400).json({ error: 'Expected a JSON object' });
+            (req as any).body = body;
+          }
+          const mod = await server.ssrLoadModule(routes[route]);
           await mod.default(req, mockRes);
         } catch (e) {
-          console.error(`API route error [${route}]:`, e);
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Internal server error' }));
+          if (res.destroyed || res.writableEnded) return;
+          const status = (e as { status?: number }).status === 413 ? 413 : 500;
+          mockRes.status(status).json({ error: status === 413 ? 'Request too large' : 'Internal server error' });
         }
       });
     },
