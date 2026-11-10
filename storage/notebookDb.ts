@@ -34,9 +34,16 @@ function runReadonly<T>(db: IDBDatabase, runner: (store: IDBObjectStore) => Prom
 }
 
 function runReadwrite<T>(db: IDBDatabase, runner: (store: IDBObjectStore) => Promise<T>): Promise<T> {
-  const tx = db.transaction(STORE_NAME, 'readwrite');
-  const store = tx.objectStore(STORE_NAME);
-  return runner(store);
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    let result: T;
+    tx.oncomplete = () => resolve(result);
+    tx.onabort = () => reject(tx.error || new Error('Notebook transaction aborted'));
+    runner(tx.objectStore(STORE_NAME)).then((value) => { result = value; }, (error) => {
+      try { tx.abort(); } catch { /* Transaction may already have aborted. */ }
+      reject(error);
+    });
+  });
 }
 
 function requestToPromise<T>(req: IDBRequest<T>): Promise<T> {
@@ -65,29 +72,27 @@ async function writeAllToDb(db: IDBDatabase, items: NotebookItem[]): Promise<voi
 }
 
 async function migrateLegacyNotebook(db: IDBDatabase): Promise<void> {
-  const existing = await readAllFromDb(db);
-  if (existing.length > 0) return;
-
+  // A fallback snapshot comes from a newer failed write, even when it is empty.
   const legacyRaw = localStorage.getItem(LEGACY_NOTEBOOK_KEY);
   if (!legacyRaw) return;
 
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(legacyRaw);
-    if (!Array.isArray(parsed)) return;
-    const items = parsed.filter((x): x is NotebookItem =>
-      typeof x?.id === 'number' &&
-      typeof x?.subject === 'string' &&
-      typeof x?.image === 'string' &&
-      typeof x?.analysis === 'string' &&
-      typeof x?.date === 'string',
-    );
-    if (items.length > 0) {
-      await writeAllToDb(db, items);
-    }
-    localStorage.removeItem(LEGACY_NOTEBOOK_KEY);
+    parsed = JSON.parse(legacyRaw);
   } catch {
-    // keep legacy data if parse fails
+    return; // Keep malformed legacy data without replacing valid database data.
   }
+  if (!Array.isArray(parsed)) return;
+  const items = parsed.filter((x): x is NotebookItem =>
+    typeof x?.id === 'number' &&
+    typeof x?.subject === 'string' &&
+    typeof x?.image === 'string' &&
+    typeof x?.analysis === 'string' &&
+    typeof x?.date === 'string',
+  );
+  if (parsed.length > 0 && items.length === 0) return;
+  await writeAllToDb(db, items);
+  localStorage.removeItem(LEGACY_NOTEBOOK_KEY);
 }
 
 function loadLegacyNotebookFallback(): NotebookItem[] {
@@ -115,12 +120,15 @@ export async function loadNotebook(): Promise<NotebookItem[]> {
     return loadLegacyNotebookFallback();
   }
 
+  let db: IDBDatabase | undefined;
   try {
-    const db = await openNotebookDb();
+    db = await openNotebookDb();
     await migrateLegacyNotebook(db);
     return await readAllFromDb(db);
   } catch {
     return loadLegacyNotebookFallback();
+  } finally {
+    db?.close();
   }
 }
 
@@ -130,11 +138,14 @@ export async function persistNotebook(items: NotebookItem[]): Promise<void> {
     return;
   }
 
+  let db: IDBDatabase | undefined;
   try {
-    const db = await openNotebookDb();
+    db = await openNotebookDb();
     await writeAllToDb(db, items);
     localStorage.removeItem(LEGACY_NOTEBOOK_KEY);
   } catch {
     localStorage.setItem(LEGACY_NOTEBOOK_KEY, JSON.stringify(items));
+  } finally {
+    db?.close();
   }
 }
